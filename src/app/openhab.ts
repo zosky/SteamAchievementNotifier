@@ -1,8 +1,7 @@
-import { app } from "electron"
-import Store from "electron-store"
 import { log } from "./log"
+import { sanconfig } from "./config"
 
-const config = new Store()
+const config = sanconfig.get()
 
 /**
  * Event types that can be sent to OpenHAB
@@ -39,6 +38,7 @@ export type OpenHABEvent = OpenHABGameEvent | OpenHABAchievementEvent
  */
 export function isOpenHABEnabled(): boolean {
     const enabled = config.get("openhab_enabled")
+    log.write("INFO", `OpenHAB enabled check: raw value = ${JSON.stringify(enabled)}, type = ${typeof enabled}`)
     return typeof enabled === "boolean" ? enabled : false
 }
 
@@ -120,7 +120,7 @@ export async function sendOpenHABEvent(
             method: "POST",
             headers: {
                 "Content-Type": "text/plain",
-                "User-Agent": `Steam Achievement Notifier/${app.getVersion()}`
+                "User-Agent": "Steam Achievement Notifier"
             },
             body: simpleValue
         })

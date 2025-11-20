@@ -24,6 +24,12 @@ let emu: string | null = null
 export const listeners = {
     setexit: () => {
         ipcMain.on("exit",(event,reason) => {
+            // Clean up Steam log watcher first
+            if (steamLogWatcher) {
+                steamLogWatcher.stop()
+                steamLogWatcher = null
+            }
+
             if (extwin) {
                 extwin.destroy()
                 extwin = null
@@ -360,7 +366,13 @@ export const listeners = {
             const success = steamLogWatcher.start((logevent) => {
                 log.write("INFO", `Steam log event received: ${logevent.type} AppID ${logevent.appid}`)
                 // Forward event to worker process
-                worker && worker.webContents.send("steamlogevent", logevent)
+                try {
+                    if (worker && !worker.isDestroyed()) {
+                        worker.webContents.send("steamlogevent", logevent)
+                    }
+                } catch (err) {
+                    log.write("ERROR", `Error sending steam log event to worker: ${(err as Error).message}`)
+                }
             })
             
             if (success) {

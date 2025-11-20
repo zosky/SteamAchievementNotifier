@@ -7,6 +7,7 @@ import { sanconfig } from "./config"
 import { cachedata, checkunlockstatus, getachievementicon, cacheachievementicons, getlocalisedachievementinfo } from "./achievement"
 import { getGamePath } from "steam-game-path"
 import { getlogmap, getlastactions, executeaction, testraunlock, emu, rasupported, racached } from "./ra"
+import { SteamLogEvent } from "./steamlog"
 
 declare global {
     interface Window {
@@ -20,6 +21,11 @@ declare global {
 
 log.init("WORKER")
 sanhelper.errorhandler(log)
+
+// Global state for Steam log monitoring mode
+let currentAppId: number = 0
+let currentGameTimer: NodeJS.Timeout | null = null
+let steamLogMode: boolean = false
 
 const resolvefilepath = (dir: string,file: string) => {
     if (process.platform === "win32") {
@@ -38,11 +44,294 @@ const resolvefilepath = (dir: string,file: string) => {
     return null
 }
 
+// Handle Steam log events (for log monitoring mode)
+const handleSteamLogEvent = (event: SteamLogEvent) => {
+    const config = sanconfig.get()
+    const { appid, type } = event
+    
+    log.write("INFO", `Steam log event: ${type} AppID ${appid}`)
+    
+    if (type === "added") {
+        // Check exclusion list
+        const { exclusions, inclusionlist } = config.store
+        const match = inclusionlist ? !exclusions.includes(appid) : exclusions.includes(appid)
+        
+        if (match) {
+            log.write("INFO", `AppID ${appid} ${inclusionlist ? "not in In" : "in Ex"}clusion List - skipping`)
+            return
+        }
+        
+        if (currentAppId !== 0 && currentAppId !== appid) {
+            log.write("WARN", `New game detected (${appid}) while ${currentAppId} is running - stopping old game first`)
+            stopCurrentGame()
+        }
+        
+        currentAppId = appid
+        const { pollrate, debug, noiconcache, initdelay } = config.store
+        
+        const appinfo: AppInfo = {
+            appid: appid,
+            gamename: "", // Will be fetched from Steamworks
+            pollrate: typeof pollrate !== "number" ? 250 : (pollrate < 50 ? 50 : pollrate),
+            releasedelay: 0, // Not needed with log monitoring
+            maxretries: 0,   // Not needed with log monitoring
+            userust: config.get("userust") as boolean,
+            debug: debug,
+            noiconcache: noiconcache
+        }
+        
+        initdelay && log.write("INFO",`Tracking process delayed by ${initdelay} seconds`)
+        setTimeout(() => startGameTracking(appinfo), (initdelay || 0) * 1000)
+        
+    } else if (type === "removed") {
+        if (currentAppId === appid) {
+            log.write("INFO", `Game ${appid} removed from Steam`)
+            stopCurrentGame()
+            currentAppId = 0
+        }
+    }
+}
+
+// Start tracking a game (simplified for log mode - no process detection needed)
+const startGameTracking = async (appinfo: AppInfo) => {
+    try {
+        const { appid, pollrate, debug, noiconcache } = appinfo
+        
+        log.write("INFO", `Starting game tracking for AppID ${appid}`)
+        
+        const { init } = await import("steamworks.js")
+        const client = init(appid)
+        sanhelper.devmode && (window.client = client)
+        
+        const rustlog = client.log.initLogger(path.join(sanhelper.appdata, "logs"))
+        log.write("INFO", rustlog)
+        
+        const steam3id = client.localplayer.getSteamId().accountId
+        const steam64id = client.localplayer.getSteamId().steamId64.toString().replace(/n$/, "")
+        const username = client.localplayer.getName()
+        const num = client.achievement.getNumAchievements()
+        // Get game name from Steam API since getGameName doesn't exist
+        const gamename = "" // Will show as appid until we can get name
+        
+        log.write("INFO", `Started tracking: ${gamename} (AppID: ${appid}, ${num} achievements)`)
+        
+        // Update stats object
+        statsobj.appid = appid
+        statsobj.gamename = gamename
+        
+        // Send tracking notification
+        ipcRenderer.send("appid", appid, gamename, steam3id, num)
+        ipcRenderer.send("workeractive", true)
+        ipcRenderer.send("stats", statsobj)
+        
+        // Start achievement monitoring loop
+        const apinames: string[] = num ? client.achievement.getAchievementNames() : []
+        let cache: Achievement[] = num ? cachedata(client, apinames) : []
+        
+        const globallocalised = new Map<string,{ name?: string, desc?: string }>()
+        
+        const localisedobj = async (steam3id: number,achievement: Achievement) => {
+            const { maxlangretries, steamlang } = sanconfig.get().store
+        
+            let name, desc
+        
+            if (steamlang) {
+                const retries = typeof maxlangretries === "number" ? maxlangretries : 5
+                name = await getlocalisedachievementinfo(steam3id,achievement.apiname,"name",retries)
+                desc = await getlocalisedachievementinfo(steam3id,achievement.apiname,"description",retries)
+        
+                if (name || desc) {
+                    globallocalised.set(achievement.apiname,{ name: name || undefined, desc: desc || undefined })
+                }
+            }
+        
+            return { name, desc }
+        }
+        
+        const updatestats = async (appid: number,gamename: string,achievements: Achievement[],steam3id: number) => {
+            statsobj.appid = appid
+            statsobj.gamename = gamename
+            const steamlang = sanconfig.get().get("steamlang")
+            const useSteamLang = typeof steamlang === "boolean" ? steamlang : false
+            statsobj.achievements = !useSteamLang ? achievements : await Promise.all(
+                achievements.map(async achievement => {
+                    const achievementcopy = { ...achievement }
+                    const localised = globallocalised.get(achievementcopy.apiname) || await localisedobj(steam3id,achievementcopy)
+        
+                    for (const key of Object.keys(localised)) {
+                        achievementcopy[key as "name" | "desc"] = localised[key as "name" | "desc"] || achievementcopy[key as "name" | "desc"]
+                    }
+        
+                    return achievementcopy
+                })
+            )
+        
+            ipcRenderer.send("stats",statsobj)
+        }
+        
+        await updatestats(appid, gamename || "???", cache, steam3id)
+        ipcRenderer.on("steamlang", async () => await updatestats(appid, gamename || "???", cache, steam3id))
+        
+        !num && log.write("INFO", `"${gamename}" has no achievements`)
+        
+        // Achievement polling loop (much simpler - no process checking!)
+        const achievementLoop = () => {
+            if (currentAppId !== appid) {
+                // Game was stopped
+                log.write("INFO", "Achievement loop stopped - game no longer active")
+                return
+            }
+            
+            if (!num) return
+            
+            const live: Achievement[] = cachedata(client, apinames)
+            const unlocked: Achievement[] = checkunlockstatus(cache, live)
+            
+            if (unlocked.length) {
+                sanhelper.devmode && log.write("INFO", JSON.stringify(unlocked))
+                
+                unlocked.forEach(async (achievement: Achievement) => {
+                    log.write("INFO", `Achievement unlocked: ${JSON.stringify(achievement)}`)
+                    
+                    const config = sanconfig.get()
+                    const { rarity, semirarity, trophymode } = config.store
+                    const type = achievement.percent <= rarity ? "rare" : (trophymode && (achievement.percent <= semirarity && achievement.percent > rarity) ? "semi" : "main")
+                    
+                    let retries = 0
+                    
+                    const achievementicon = async (): Promise<string | null> => {
+                        let icon: string | null = null
+                        const cachedicon = !noiconcache ? resolvefilepath(sanhelper.temp, `${achievement.apiname}.jpg`) : null
+                        
+                        try {
+                            icon = cachedicon || await getachievementicon(client, achievement)
+                            if (!icon) throw new Error(`Icon for ${achievement.apiname} is null. Retrying....`)
+                            
+                            log.write("INFO", `Icon for ${achievement.apiname} saved successfully`)
+                            return icon.replace(/\\/g, "/")
+                        } catch (err) {
+                            log.write("WARN", err as string)
+                            
+                            retries++
+                            retries < 5 ? setTimeout(() => achievementicon(), 100) : log.write("ERROR", `Failed to fetch icon for ${achievement.apiname}`)
+                            
+                            return null
+                        }
+                    }
+                    
+                    const gameiconpath = path.join(sanhelper.temp, "gameicon.png")
+                    const gameicon = (config.get(`customisation.${type}.usegameicon`) && fs.existsSync(gameiconpath)) ? gameiconpath : null
+                    const localised = await localisedobj(steam3id, achievement)
+                    const themeswitch: [key: string, ThemeSwitch] | undefined = Object.entries(JSON.parse(localStorage.getItem("themeswitch")!)).find(item => parseInt(item[0]) === appid) as [key: string, ThemeSwitch] | undefined
+                    const customisation = config.get(`customisation.${type}${themeswitch ? `.usertheme.${themeswitch[1].themes[type]}.customisation` : ""}`) as Customisation
+                    
+                    if (themeswitch) {
+                        log.write("INFO", `Auto-switch entry detected for ${appid}`)
+                        sanhelper.devmode && console.log(customisation)
+                    }
+                    
+                    const notify: Notify = {
+                        id: Math.round(Date.now() / Math.random() * 1000),
+                        customisation,
+                        type,
+                        gamename: gamename || "???",
+                        steam3id,
+                        apiname: achievement.apiname,
+                        name: localised.name || achievement.name,
+                        desc: localised.desc || achievement.desc,
+                        unlocked: achievement.unlocked,
+                        hidden: achievement.hidden,
+                        percent: achievement.percent,
+                        icon: await achievementicon() || sanhelper.setfilepath("img", "sanlogosquare.svg"),
+                        gameicon: gameicon || sanhelper.setfilepath("img", "sanlogosquare.svg"),
+                        unlocktime: new Date(Date.now()).toISOString()
+                    }
+                    
+                    ;["notify", "sendwebhook"].forEach(cmd => ipcRenderer.send(cmd, notify, undefined, themeswitch?.[1].src))
+                    
+                    ;(async () => {
+                        await updatestats(appid, gamename || "???", live, steam3id)
+                        ipcRenderer.send("statsunlock", achievement, statsobj)
+                    })()
+                    
+                    // Check for 100% completion
+                    if (live.every(ach => ach.unlocked)) {
+                        const platCustomisation = config.get(`customisation.plat${themeswitch ? `.usertheme.${themeswitch[1].themes.plat}.customisation` : ""}`) as Customisation
+                        
+                        const platnotify: Notify = {
+                            id: Date.now(),
+                            customisation: platCustomisation,
+                            type: "plat",
+                            gamename: gamename || "???",
+                            steam3id: steam3id,
+                            apiname: "PLAT_NOTIFICATION",
+                            name: "100%",
+                            desc: "",
+                            unlocked: true,
+                            hidden: false,
+                            percent: 100,
+                            icon: sanhelper.setfilepath("img", "sanlogosquare.svg"),
+                            gameicon: gameicon || sanhelper.setfilepath("img", "sanlogosquare.svg"),
+                            unlocktime: new Date(Date.now()).toISOString()
+                        }
+                        
+                        ;["notify", "sendwebhook"].forEach(cmd => ipcRenderer.send(cmd, platnotify, undefined, themeswitch?.[1].src))
+                    }
+                })
+            }
+            
+            cache = live
+        }
+        
+        // Start the achievement monitoring loop
+        currentGameTimer = setInterval(achievementLoop, pollrate || 250)
+        
+        // Cache achievement icons
+        !noiconcache && await cacheachievementicons(gamename || "???", steam64id, appid)
+        
+    } catch (err) {
+        log.write("ERROR", `Failed to start tracking for AppID ${appinfo.appid}: ${(err as Error).message}`)
+        log.write("ERROR", (err as Error).stack || "")
+    }
+}
+
+// Stop tracking current game
+const stopCurrentGame = () => {
+    if (currentGameTimer) {
+        clearInterval(currentGameTimer)
+        currentGameTimer = null
+    }
+    
+    log.write("INFO", "Stopped current game tracking")
+    
+    ipcRenderer.send("validateworker")
+    
+    statsobj.appid = 0
+    statsobj.gamename = null
+    statsobj.achievements = undefined
+    
+    ipcRenderer.send("stats", statsobj)
+}
+
 const startidle = () => {
     try {
         log.write("INFO","Idle loop started")
         sanhelper.resetdebuginfo()
         ipcRenderer.send("workeractive",false)
+        
+        const config = sanconfig.get()
+        steamLogMode = config.get("usesteamlog") as boolean
+        
+        if (steamLogMode) {
+            log.write("INFO", "Using Steam log file monitoring mode")
+            // Listen for steam log events from main process
+            ipcRenderer.on("steamlogevent", (event: any, logevent: SteamLogEvent) => {
+                handleSteamLogEvent(logevent)
+            })
+            return // Don't use the old polling method
+        }
+        
+        log.write("INFO", "Using process polling mode (fallback)")
     
         let exclusionlogged = false
         

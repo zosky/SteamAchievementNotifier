@@ -10,8 +10,10 @@ import { update } from "./update"
 import { gameart } from "./gameart"
 import { screenshot } from "./screenshots"
 import { audio } from "./audio"
+import { SteamLogWatcher, isSteamLogAvailable } from "./steamlog"
 
 let appid: number = 0
+let steamLogWatcher: SteamLogWatcher | null = null
 let extwin: BrowserWindow | null = null
 let statwin: BrowserWindow | null = null
 let replay: { queueobj: WinType, src?: number } | null = null
@@ -333,6 +335,52 @@ export const listeners = {
         })
 
         ipcMain.on("runningappid",event => event.reply("runningappid",appid || 0))
+
+        // Initialize Steam log watcher if enabled
+        const initSteamLogWatcher = () => {
+            const config = sanconfig.get()
+            const usesteamlog = config.get("usesteamlog") as boolean
+            
+            if (!usesteamlog) {
+                log.write("INFO", "Steam log monitoring disabled in config")
+                return
+            }
+            
+            if (!isSteamLogAvailable()) {
+                log.write("WARN", "Steam log file not found - falling back to process monitoring")
+                const fallback = config.get("fallbacktoprocess") as boolean
+                if (!fallback) {
+                    log.write("ERROR", "Fallback to process monitoring is disabled - game detection will not work!")
+                }
+                return
+            }
+            
+            steamLogWatcher = new SteamLogWatcher()
+            const success = steamLogWatcher.start((logevent) => {
+                log.write("INFO", `Steam log event received: ${logevent.type} AppID ${logevent.appid}`)
+                // Forward event to worker process
+                worker && worker.webContents.send("steamlogevent", logevent)
+            })
+            
+            if (success) {
+                log.write("INFO", "Steam log watcher initialized successfully")
+            } else {
+                log.write("ERROR", "Failed to initialize Steam log watcher")
+                steamLogWatcher = null
+            }
+        }
+        
+        // Initialize on startup
+        initSteamLogWatcher()
+        
+        // Re-initialize if config changes
+        ipcMain.on("reinitsteamlog", () => {
+            if (steamLogWatcher) {
+                steamLogWatcher.stop()
+                steamLogWatcher = null
+            }
+            initSteamLogWatcher()
+        })
 
         let debugwin: BrowserWindow | null = null
 

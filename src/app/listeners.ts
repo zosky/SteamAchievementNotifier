@@ -11,6 +11,7 @@ import { gameart } from "./gameart"
 import { screenshot } from "./screenshots"
 import { audio } from "./audio"
 import { SteamLogWatcher, isSteamLogAvailable } from "./steamlog"
+import { shouldDisablePopups } from "./openhab"
 
 let appid: number = 0
 let steamLogWatcher: SteamLogWatcher | null = null
@@ -428,6 +429,12 @@ export const listeners = {
         ipcMain.on("workeractive", (event,value: boolean) => win.webContents.send("workeractive",value))
 
         ipcMain.on("showtrack", (event,gamename: string,ra?: { icon: string, gameartlibhero: string }) => {
+            // Skip showing tracking notification if OpenHAB disabled popups
+            if (shouldDisablePopups()) {
+                log.write("INFO", "Skipping tracking notification (OpenHAB disabled popups)")
+                return
+            }
+            
             const config = sanconfig.get()
             const { scaleFactor }: Monitor = config.get("monitors").find(monitor => monitor.primary)!
 

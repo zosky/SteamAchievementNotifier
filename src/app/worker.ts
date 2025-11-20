@@ -8,6 +8,7 @@ import { cachedata, checkunlockstatus, getachievementicon, cacheachievementicons
 import { getGamePath } from "steam-game-path"
 import { getlogmap, getlastactions, executeaction, testraunlock, emu, rasupported, racached } from "./ra"
 import { SteamLogEvent } from "./steamlog"
+import { sendGameStarted, sendGameEnded, sendAchievementUnlocked, shouldDisablePopups } from "./openhab"
 
 declare global {
     interface Window {
@@ -114,6 +115,12 @@ const startGameTracking = async (appinfo: AppInfo) => {
         const gamename = "" // Will show as appid until we can get name
         
         log.write("INFO", `Started tracking: ${gamename} (AppID: ${appid}, ${num} achievements)`)
+        
+        // Store current game info for OpenHAB
+        currentAppId = appid
+        
+        // Send OpenHAB game_started event
+        await sendGameStarted(appid, gamename || `AppID ${appid}`)
         
         // Update stats object
         statsobj.appid = appid
@@ -247,7 +254,19 @@ const startGameTracking = async (appinfo: AppInfo) => {
                         unlocktime: new Date(Date.now()).toISOString()
                     }
                     
-                    ;["notify", "sendwebhook"].forEach(cmd => ipcRenderer.send(cmd, notify, undefined, themeswitch?.[1].src))
+                    // Send OpenHAB achievement_unlocked event
+                    await sendAchievementUnlocked(
+                        appid,
+                        gamename || `AppID ${appid}`,
+                        achievement.apiname,
+                        localised.name || achievement.name,
+                        localised.desc || achievement.desc
+                    )
+                    
+                    // Send notification (unless OpenHAB disabled popups)
+                    if (!shouldDisablePopups()) {
+                        ;["notify", "sendwebhook"].forEach(cmd => ipcRenderer.send(cmd, notify, undefined, themeswitch?.[1].src))
+                    }
                     
                     ;(async () => {
                         await updatestats(appid, gamename || "???", live, steam3id)
@@ -275,7 +294,10 @@ const startGameTracking = async (appinfo: AppInfo) => {
                             unlocktime: new Date(Date.now()).toISOString()
                         }
                         
-                        ;["notify", "sendwebhook"].forEach(cmd => ipcRenderer.send(cmd, platnotify, undefined, themeswitch?.[1].src))
+                        // Send 100% notification (unless OpenHAB disabled popups)
+                        if (!shouldDisablePopups()) {
+                            ;["notify", "sendwebhook"].forEach(cmd => ipcRenderer.send(cmd, platnotify, undefined, themeswitch?.[1].src))
+                        }
                     }
                 })
             }
@@ -296,7 +318,7 @@ const startGameTracking = async (appinfo: AppInfo) => {
 }
 
 // Stop tracking current game
-const stopCurrentGame = () => {
+const stopCurrentGame = async () => {
     if (currentGameTimer) {
         clearInterval(currentGameTimer)
         currentGameTimer = null
@@ -304,8 +326,14 @@ const stopCurrentGame = () => {
     
     log.write("INFO", "Stopped current game tracking")
     
+    // Send OpenHAB game_ended event
+    if (currentAppId > 0) {
+        await sendGameEnded(currentAppId, statsobj.gamename || `AppID ${currentAppId}`)
+    }
+    
     ipcRenderer.send("validateworker")
     
+    currentAppId = 0
     statsobj.appid = 0
     statsobj.gamename = null
     statsobj.achievements = undefined
